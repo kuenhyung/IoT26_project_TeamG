@@ -5,19 +5,27 @@ import subprocess
 import board
 import adafruit_dht
 import smbus2
-from ultralytics import YOLO
+import yolov5
+import torch
 import cv2
 import requests
 from datetime import datetime
 
-NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
+# === PyTorch 2.6+ 보안 규칙 통과 ===
+_original_load = torch.load
+def _patched_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+torch.load = _patched_load
+
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "your_token_here")
 DATABASE_ID = "372d0cc3fc948057a931f35f1fb73adc"
 TRIG = 23
 ECHO = 25
 DHT_PIN = board.D4
 LCD_ADDR = 0x27
 DISTANCE_THRESHOLD = 50
-FAIL_TIMEOUT = 5
+FAIL_TIMEOUT = 1.0
 
 h = lgpio.gpiochip_open(0)
 lgpio.gpio_claim_output(h, TRIG)
@@ -54,18 +62,16 @@ def get_distance():
     lgpio.gpio_write(h, TRIG, 1)
     time.sleep(0.00001)
     lgpio.gpio_write(h, TRIG, 0)
-    start = time.time()
-    timeout = False
+    timeout_start = time.time()
     while lgpio.gpio_read(h, ECHO) == 0:
-        if time.time() - start > 0.5:
-            timeout = True
-            break
-        start = time.time()
-    if timeout:
-        return 999
-    end = start
+        if time.time() - timeout_start > 0.03:
+            return 999
+    start = time.time()
+    timeout_start = time.time()
     while lgpio.gpio_read(h, ECHO) == 1:
-        end = time.time()
+        if time.time() - timeout_start > 0.03:
+            return 999
+    end = time.time()
     return (end - start) * 17150
 
 def capture_image():
@@ -97,17 +103,17 @@ def log_to_notion(label, confidence, temp, humidity):
         print(f"오류: {response.text}")
 
 LABELS = {
-    "bottle": ("Plastic", "플라스틱통에"),
-    "can": ("Can/Metal", "캔통에"),
-    "cup": ("Plastic", "플라스틱통에"),
-    "book": ("Paper", "종이통에"),
-    "paper": ("Paper", "종이통에"),
-    "scissors": ("Metal", "캔통에"),
-    "apple": ("Food", "음식물통에"),
-    "banana": ("Food", "음식물통에"),
+    "plastic":       ("Plastic", "플라스틱통에"),
+    "metal":         ("Can/Metal", "캔통에"),
+    "paper":         ("Paper", "종이통에"),
+    "cardboard":     ("Paper", "종이통에"),
+    "glass":         ("Glass", "유리통에"),
+    "biodegradable": ("Food", "음식물통에"),
 }
 
-model = YOLO("yolov8n.pt")
+model = yolov5.load("garbage.pt")
+model.conf = 0.25
+
 lcd_init()
 lcd_print("Smart Recycling", "Ready...")
 print("시스템 시작!")
@@ -138,14 +144,14 @@ try:
                 ret, frame = capture_image()
 
                 if ret:
-                    results = model(frame)
-                    boxes = results[0].boxes
+                    results = model(frame, size=640)
+                    preds = results.pred[0]
 
-                    if len(boxes) > 0:
-                        best = max(boxes, key=lambda b: b.conf[0])
-                        label_id = int(best.cls[0])
+                    if len(preds) > 0:
+                        best = preds[preds[:, 4].argmax()]
+                        confidence = float(best[4])
+                        label_id = int(best[5])
                         label_name = model.names[label_id]
-                        confidence = float(best.conf[0])
 
                         category, location = LABELS.get(label_name, (label_name, "일반쓰레기통에"))
                         print(f"분류: {category} ({confidence*100:.1f}%)")
